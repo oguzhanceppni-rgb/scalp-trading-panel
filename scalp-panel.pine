@@ -1,10 +1,10 @@
 //@version=6
-indicator("Scalp Panel [Claude]", overlay = true, max_boxes_count = 60)
+indicator("Scalp Panel [Claude]", overlay = true, max_boxes_count = 60, max_labels_count = 500)
 
 equity  = input.float(200,  "Portföy ($)")
 riskPct = input.float(3.0,  "İşlem başı max kayıp %") / 100
-minRR   = input.float(2.0,  "Min net R:R")
-feePct  = input.float(0.05, "Taker komisyon % (tek yön)") / 100
+tpR     = input.float(2.0,  "TP (R katı)")
+feePct  = input.float(0.0,  "Taker komisyon % (tek yön)") / 100
 vwmaLen = input.int(20,     "HAHO (VWMA) uzunluk")
 rsiLen  = input.int(14,     "RSI uzunluk")
 pv      = input.int(3,      "Pivot sol/sağ bar")
@@ -12,8 +12,10 @@ fresh   = input.int(10,     "Uyumsuzluk tazeliği (o TF'nin barı)")
 tol     = input.float(0.05, "Temas toleransı %") / 100
 swLen   = input.int(5,      "P/D swing pivot (giriş bölgesinin TF'i, sol/sağ bar)")
 keyTol  = input.float(0.10, "Bölge–likidite yakınlık toleransı %") / 100
-bosLen  = input.int(3,      "BOS swing pivot (5m, sol/sağ bar)")
-bosFresh = input.int(24,    "BOS tazeliği (5m bar)")
+bosRun  = input.int(3,      "BOS: ardışık ters mum sayısı (min)")
+bosFresh = input.int(6,     "BOS tazeliği (5m bar)")
+slAtr   = input.float(1.5,  "Min SL (ATR katı)")
+yThr    = input.float(0.05, "Faiz hareket eşiği % (son kapanmış 1H mum)")
 
 touch(v, i) => low[i] <= v[i] * (1 + tol) and high[i] >= v[i] * (1 - tol)
 inZ(t, b) => not na(t) and low <= t and high >= b
@@ -147,6 +149,30 @@ tD = request.security(syminfo.tickerid, "D",   trendF(), lookahead = barmerge.lo
 [v1, h1] = request.security(syminfo.tickerid, "60",  hahoF(), lookahead = barmerge.lookahead_on)
 [v4, h4] = request.security(syminfo.tickerid, "240", hahoF(), lookahead = barmerge.lookahead_on)
 [vD, hD] = request.security(syminfo.tickerid, "D",   hahoF(), lookahead = barmerge.lookahead_on)
+// bias: son KAPANMIŞ 4H mumunun VWMA20'si (backtest ile aynı, repaint yok)
+hahoC() => ta.vwma(close, vwmaLen)[1]
+v1c = request.security(syminfo.tickerid, "60",  hahoC(), lookahead = barmerge.lookahead_on)
+vDc = request.security(syminfo.tickerid, "D",   hahoC(), lookahead = barmerge.lookahead_on)
+v4c = request.security(syminfo.tickerid, "240", ta.vwma(close, vwmaLen)[1], lookahead = barmerge.lookahead_on)
+// 4H bias (kullanıcı, 21.10): son KAPANMIŞ 4H mumun gövde kapanışı 4H VWAP20'nin (hlc3×hacim, 20 mum) üstünde → LONG, altında → SHORT.
+// Hacim yoksa (faizler) hlc3'ün 20 mumluk ortalaması.
+biasF() =>
+    sv = math.sum(volume, 20)
+    spv = math.sum(hlc3 * volume, 20)
+    sm = ta.sma(hlc3, 20)
+    vw20 = sv > 0 ? spv / sv : sm
+    b = close > vw20 ? 1 : close < vw20 ? -1 : 0
+    [b[1], vw20[1], close[1]]
+[b4, b4v, b4c] = request.security(syminfo.tickerid, "240", biasF(), lookahead = barmerge.lookahead_on)
+[b1h, b1v, b1c] = request.security(syminfo.tickerid, "60", biasF(), lookahead = barmerge.lookahead_on)
+// 23.10 test: emtia (XAU/XAG) kendi bias'ı 1H'de, endeksler 4H'de daha iyi
+cmdB = str.contains(syminfo.ticker, "XAU") or str.contains(syminfo.ticker, "XAG")
+bB  = cmdB ? b1h : b4
+bBv = cmdB ? b1v : b4v
+bBc = cmdB ? b1c : b4c
+bTF = cmdB ? "1H" : "4H"
+[y10b, y10v, y10c] = request.security("TVC:US10Y", "60", biasF(), lookahead = barmerge.lookahead_on)
+[y02b, y02v, y02c] = request.security("TVC:US02Y", "60", biasF(), lookahead = barmerge.lookahead_on)
 [d15, a15] = request.security(syminfo.tickerid, "15", divClosed(), lookahead = barmerge.lookahead_on)
 [d45, a45] = request.security(syminfo.tickerid, "45", divClosed(), lookahead = barmerge.lookahead_on)
 [d60, a60] = request.security(syminfo.tickerid, "60", divClosed(), lookahead = barmerge.lookahead_on)
@@ -163,41 +189,52 @@ swF() =>
     // Onaylanmamış son tepe/dip (son swLen+1 bar) da aralığa dahil: kırılımda aralık bayatlamasın
     [math.max(nz(sh, high), ta.highest(high, swLen + 1)), math.min(nz(sl, low), ta.lowest(low, swLen + 1))]
 [pdH, pdL] = request.security(syminfo.tickerid, "15", swF(), lookahead = barmerge.lookahead_on)
-[pdH1, pdL1] = request.security(syminfo.tickerid, "1", swF())
 [pdH5, pdL5] = request.security(syminfo.tickerid, "5", swF())
-[b1, s1, bSL1, sSL1, z1_0, z1_1, z1_2, z1_3, z1_4, z1_5, z1_6, z1_7, z1_8, z1_9, z1_10, z1_11, z1_12, z1_13, z1_14, z1_15, z1_16, z1_17] = request.security(syminfo.tickerid, "1",  zonesF())
 [b5, s5, bSL5, sSL5, z5_0, z5_1, z5_2, z5_3, z5_4, z5_5, z5_6, z5_7, z5_8, z5_9, z5_10, z5_11, z5_12, z5_13, z5_14, z5_15, z5_16, z5_17] = request.security(syminfo.tickerid, "5",  zonesF())
 [b15, s15, bSL15, sSL15, z15_0, z15_1, z15_2, z15_3, z15_4, z15_5, z15_6, z15_7, z15_8, z15_9, z15_10, z15_11, z15_12, z15_13, z15_14, z15_15, z15_16, z15_17] = request.security(syminfo.tickerid, "15", zonesF(), lookahead = barmerge.lookahead_on)
 
-// ICT dönüş: BOS (5m). Kapanış son swing tepesinin üstüne çıkarsa boğa BOS, son swing dibinin altına inerse ayı BOS.
+// Kullanıcı BOS'u (5m): ard arda ≥bosRun düşüş mumu dizisinin ilk mumunun açılışı üstünde kapanış → boğa BOS; tersi ayı BOS.
 bosF() =>
-    ph = ta.pivothigh(high, bosLen, bosLen)
-    pl = ta.pivotlow(low, bosLen, bosLen)
-    var float lh = na
-    var float ll = na
+    var float dnS = na
+    var float upS = na
+    var int rd = 0
+    var int rl = 0
+    var float ro = na
     var int dir = 0
     var int at = na
     var float lvl = na
-    if not na(ph)
-        lh := ph
-    if not na(pl)
-        ll := pl
-    if not na(lh) and close > lh
+    if not na(dnS) and close > dnS
         dir := 1
         at := bar_index
-        lvl := lh
-        lh := na
-    if not na(ll) and close < ll
+        lvl := dnS
+        dnS := na
+    if not na(upS) and close < upS
         dir := -1
         at := bar_index
-        lvl := ll
-        ll := na
+        lvl := upS
+        upS := na
+    cd = close > open ? 1 : close < open ? -1 : 0
+    if cd != 0 and cd == rd
+        rl += 1
+    else
+        rd := cd
+        rl := 1
+        ro := open
+    if rl >= bosRun
+        if rd == -1
+            dnS := ro
+        else if rd == 1
+            upS := ro
     [dir, bar_index - at, lvl]
 [bosD, bosA, bosLv] = request.security(syminfo.tickerid, "5", bosF())
 bosOk = bosD != 0 and bosA <= bosFresh
 
-vw  = ta.vwap(hlc3)
-vwT = touch(vw, 0) or touch(vw, 1) or touch(vw, 2)
+vw  = ta.vwap(hlc3, ta.change(dayofmonth(time, "Europe/Istanbul")) != 0)
+vwT = touch(vw, 0) or touch(vw, 1)
+t5(v) => (low <= v * (1 + tol) and high >= v * (1 - tol)) or (low[1] <= v[1] * (1 + tol) and high[1] >= v[1] * (1 - tol))
+hT1 = t5(v1c)
+hT4 = t5(v4c)
+hTD = t5(vDc)
 atr = ta.atr(14)
 var int t0 = time
 
@@ -213,178 +250,62 @@ R  = hD ? sdD : h4 ? sd4 : h1 ? sd1 : vwT ? sdV : 0
 pos   = (close - pdL) / (pdH - pdL)
 fr0(d, a) => d != 0 and a <= fresh
 dv = fr0(d15, a15) ? d15 : fr0(d45, a45) ? d45 : fr0(d60, a60) ? d60 : 0
-// Yön = taze BOS yönü (zorunlu). BOS yoksa yön yalnızca gösterim içindir, işlem açılmaz.
-T = bosOk ? bosD : R != 0 ? R : dv != 0 ? dv : pos > 0.5 ? -1 : 1
-// Temas ancak BOS yönünde tepki veriyorsa sayılır (long için destek, short için direnç)
-step2 = R != 0 and R == T
-fr(d, a) => d == T and a <= fresh
-divOk = fr(d15, a15) or fr(d45, a45) or fr(d60, a60)
-// Temanın tepki yönüne ters taze uyumsuzluk varsa (ve aynı yönde yoksa) işlem yok
-divOpp   = (fr0(d15, a15) and d15 == -T) or (fr0(d45, a45) and d45 == -T) or (fr0(d60, a60) and d60 == -T)
-conflict = divOpp and not divOk
-
-// Likidite seviyeleri: ICT Killzones seans tepe-dipleri (NY saati: Asya 20-00, Londra 02-05, NY AM 09:30-11, Lunch 12-13, PM 13:30-16) ve 5m swing'ler
-sessHL(sess) =>
-    inS = not na(time(timeframe.period, sess, "America/New_York"))
-    var float hi = na
-    var float lo = na
-    var float lHi = na
-    var float lLo = na
-    if inS and not inS[1]
-        hi := high
-        lo := low
-    else if inS
-        hi := math.max(hi, high)
-        lo := math.min(lo, low)
-    if not inS and inS[1]
-        lHi := hi
-        lLo := lo
-    [hi, lo, lHi, lLo]
-[aH, aL, aH0, aL0] = sessHL("2000-0000")
-[lnH, lnL, lnH0, lnL0] = sessHL("0200-0500")
-[nyH, nyL, nyH0, nyL0] = sessHL("0930-1100")
-[nlH, nlL, nlH0, nlL0] = sessHL("1200-1300")
-[npH, npL, npH0, npL0] = sessHL("1330-1600")
-var swH = array.new_float()
-var swL = array.new_float()
-pH5 = ta.pivothigh(high, 5, 5)
-pL5 = ta.pivotlow(low, 5, 5)
-if not na(pH5)
-    array.unshift(swH, pH5)
-    if array.size(swH) > 5
-        array.pop(swH)
-if not na(pL5)
-    array.unshift(swL, pL5)
-    if array.size(swL) > 5
-        array.pop(swL)
-lv = array.new_float()
-lb = array.new_string()
-add(v, n) =>
-    if not na(v)
-        array.push(lv, v)
-        array.push(lb, n)
-add(aH, "Asya H")
-add(aL, "Asya L")
-add(aH0, "Asya H")
-add(aL0, "Asya L")
-add(lnH, "Londra H")
-add(lnL, "Londra L")
-add(lnH0, "Londra H")
-add(lnL0, "Londra L")
-add(nyH, "NYAM H")
-add(nyL, "NYAM L")
-add(nyH0, "NYAM H")
-add(nyL0, "NYAM L")
-add(nlH, "NYL H")
-add(nlL, "NYL L")
-add(nlH0, "NYL H")
-add(nlL0, "NYL L")
-add(npH, "NYPM H")
-add(npL, "NYPM L")
-add(npH0, "NYPM H")
-add(npL0, "NYPM L")
-for v in swH
-    add(v, "Swing H")
-for v in swL
-    add(v, "Swing L")
-
-// Değerli bölge = içinde ya da ±keyTol yakınında likidite seviyesi (seans/swing) veya HAHO/HAOF olan FVG/iFVG/OB.
-// Birden fazla değerliyse büyük zaman dilimi öncelikli (15m > 5m > 1m); SL o bölgenin ötesine konur.
-keyNear(t, b) =>
-    k = (t + b) / 2 * keyTol
-    hit = ""
-    for [i, v] in lv
-        if hit == "" and v >= b - k and v <= t + k
-            hit := array.get(lb, i)
-    if hit == ""
-        hit := v1 >= b - k and v1 <= t + k ? "HAHO 1H" : v4 >= b - k and v4 <= t + k ? "HAHO 4H" : vD >= b - k and vD <= t + k ? "HAHO D" : vw >= b - k and vw <= t + k ? "HAOF" : ""
-    hit
-cT = array.new_float()
-cB = array.new_float()
-cN = array.new_string()
-pick(t, b, nm) =>
-    if not na(t) and low <= t and high >= b
-        array.push(cT, t)
-        array.push(cB, b)
-        array.push(cN, nm)
-// 1m → 5m → 15m sırasıyla eklenir; döngüde sonraki (büyük TF) değerli bölge öncekini ezer
-if T == 1
-    pick(z1_0, z1_1, "1m FVG")
-    pick(z1_6, z1_7, "1m iFVG")
-    pick(z1_12, z1_13, "1m OB")
-    pick(z5_0, z5_1, "5m FVG")
-    pick(z5_6, z5_7, "5m iFVG")
-    pick(z5_12, z5_13, "5m OB")
-    pick(z15_0, z15_1, "15m FVG")
-    pick(z15_6, z15_7, "15m iFVG")
-    pick(z15_12, z15_13, "15m OB")
-else
-    pick(z1_3, z1_4, "1m FVG")
-    pick(z1_9, z1_10, "1m iFVG")
-    pick(z1_15, z1_16, "1m OB")
-    pick(z5_3, z5_4, "5m FVG")
-    pick(z5_9, z5_10, "5m iFVG")
-    pick(z5_15, z5_16, "5m OB")
-    pick(z15_3, z15_4, "15m FVG")
-    pick(z15_9, z15_10, "15m iFVG")
-    pick(z15_15, z15_16, "15m OB")
-float zT = na
-float zB = na
-string zN = ""
-for [i, t] in cT
-    why = keyNear(t, array.get(cB, i))
-    if why != ""
-        zT := t
-        zB := array.get(cB, i)
-        zN := array.get(cN, i) + " @" + why
-zone   = zN
+// Yön = 4H bias (kapanmış 4H gövde kapanışı vs 4H VWAP20).
+// Giriş: aynı yönde taze kullanıcı BOS'u + o yönde 5m bölge içinde + puan ≥1 (RSI uyumsuzluğu / HAHO-HAOF teması / P/D).
+T = bB >= 0 ? 1 : -1
+divOk = dv == T
+zone   = T == 1 ? b5 : s5
 zoneOk = zone != ""
-zSL    = T == 1 ? zB : zT
-// P/D, girişin alınacağı bölgenin TF'indeki swing aralığına göre (bölge yoksa 15m)
-pdTF = str.startswith(zN, "1m") ? "1m" : str.startswith(zN, "5m") ? "5m" : "15m"
-zH   = pdTF == "1m" ? pdH1 : pdTF == "5m" ? pdH5 : pdH
-zL   = pdTF == "1m" ? pdL1 : pdTF == "5m" ? pdL5 : pdL
+zSL    = T == 1 ? bSL5 : sSL5
+pdTF = "5m"
+zH   = pdH5
+zL   = pdL5
 zPos = (close - zL) / (zH - zL)
-pdOk = T == 1 ? zPos < 0.5 : T == -1 ? zPos > 0.5 : false
+pdOk = T == 1 ? zPos < 0.5 : zPos > 0.5
+tchOk = hT1 or hT4 or hTD or vwT
+score = (divOk ? 1 : 0) + (tchOk ? 1 : 0) + (pdOk ? 1 : 0)
+bosOk2 = bosOk and bosD == T
+// ZORUNLU (kullanıcı kuralı 21.10): XAU/XAG faizle ters korele işlem alır.
+// US10Y ve US02Y son KAPANMIŞ 1H mumunun değişimi (21.10 test: 4 saatlik pencereden iyi); ikisinden hiçbiri işlem yönüyle aynı yönde olmayacak, en az biri ters yönde olacak.
+y10 = y10b
+y02 = y02b
+isCmd = str.contains(syminfo.ticker, "XAU") or str.contains(syminfo.ticker, "XAG")
+// Emtia, faizin (10Y ve 2Y aynı yönde) 1H bias'ının (23.10 test: 4H'den iyi) TERSİNE işlem alır; faiz bias'ları ayrışırsa emtiada işlem yok.
+macroOk = not isCmd or (y10b == y02b and y10b == -T)
 
-// Risk: kayıp (komisyon dahil) portföyün riskPct'i; TP net R:R >= minRR
+// Risk: kayıp (komisyon dahil) portföyün riskPct'i; TP = tpR × risk (20.10 backtest: sabit 3R)
 entry = close
-// SL bölgenin ötesinde ve en az max(1 ATR(5m), %0.15) uzakta: gürültüde stop olmasın, komisyon riski yutmasın
-minD  = math.max(atr, entry * 0.0015)
+// SL bölgenin 0.25 ATR ötesinde ve en az slAtr × ATR(5m) uzakta
+minD  = atr * slAtr
 sl    = T == 1 ? math.min(nz(zSL, entry) - atr * 0.25, entry - minD) : math.max(nz(zSL, entry) + atr * 0.25, entry + minD)
 risk  = math.abs(entry - sl)
 fee   = entry * feePct * 2
-// TP = likidite; 4H trendine ters işlemde en yakın likidite, değilse net R:R ≥ minRR veren en yakın likidite
-minDist = minRR * (risk + fee) + fee
-counter = t4 == -T
-float nearD = na
-string nearN = ""
-float okD = na
-string okN = ""
-for [i, v] in lv
-    d = (v - entry) * T
-    if d > fee
-        if na(nearD) or d < nearD
-            nearD := d
-            nearN := array.get(lb, i)
-        if d >= minDist and (na(okD) or d < okD)
-            okD := d
-            okN := array.get(lb, i)
-tpD   = counter ? nearD : okD
-tpN   = counter ? nearN : okN
-tp    = na(tpD) ? na : entry + T * tpD
-liqOk = not na(tpD) and tpD >= minDist
-rrNet = na(tpD) ? na : (tpD - fee) / (risk + fee)
+tp    = entry + T * tpR * (risk + fee)
+rrNet = tpR
 qty   = equity * riskPct / (risk + fee)
 lev   = qty * entry / equity
-// 5 kontrolden ≥3; değerli ICT bölgesi ve R:R ≥ 2 (likidite TP ile) zorunlu
-checks = (step2 ? 1 : 0) + (divOk ? 1 : 0) + (pdOk ? 1 : 0) + (zoneOk ? 1 : 0) + (liqOk ? 1 : 0)
-setup = bosOk and zoneOk and liqOk and checks >= 3 and not conflict
+// Üçü zorunlu: 4H yönünde taze BOS + o yönde 5m bölge + puan ≥1
+checks = (bosOk2 ? 1 : 0) + (zoneOk ? 1 : 0) + (score >= 1 ? 1 : 0)
+setup = checks == 3 and macroOk
 
-alertcondition(setup and T == 1,  "LONG kurulum",  "Scalp Panel: LONG kurulum")
-alertcondition(setup and T == -1, "SHORT kurulum", "Scalp Panel: SHORT kurulum")
+// Canlı mum yok sayılır: sinyal son 1–2 KAPANMIŞ 5m mumdan (tarama 10 dk'da bir). Giriş şimdiki fiyat, SL sinyal mumundan, TP = tpR × yeni risk.
+sK   = setup[1] ? 1 : setup[2] ? 2 : 0
+sT   = sK == 1 ? T[1] : sK == 2 ? T[2] : 0
+sSL  = sK == 1 ? sl[1] : sK == 2 ? sl[2] : na
+sRsk = sT * (entry - sSL)
+sOk  = sK > 0 and sRsk > 0
+sTP  = entry + sT * tpR * sRsk
+sQty = equity * riskPct / sRsk
+sLev = sQty * entry / equity
+alertcondition(sOk and sT == 1,  "LONG kurulum",  "Scalp Panel: LONG kurulum")
+alertcondition(sOk and sT == -1, "SHORT kurulum", "Scalp Panel: SHORT kurulum")
+// Doğrulama: geçmiş sinyaller (kapanmış mum, seans içi) etiket olarak — backtest sinyalleriyle karşılaştırmak için
+showSig = input.bool(false, "Geçmiş sinyal etiketleri (16:20–19:00, yalnız doğrulama için; paneli yavaşlatır)")
+hmI = hour(time, "Europe/Istanbul") * 60 + minute(time, "Europe/Istanbul")
+if showSig and barstate.isconfirmed and setup and hmI >= 980 and hmI < 1140 and dayofweek(time, "Europe/Istanbul") != dayofweek.saturday and dayofweek(time, "Europe/Istanbul") != dayofweek.sunday
+    label.new(bar_index, T == 1 ? low : high, "SIG " + (T == 1 ? "L " : "S ") + str.format_time(time, "yyyy-MM-dd HH:mm", "Europe/Istanbul"), style = T == 1 ? label.style_label_up : label.style_label_down, color = color.new(T == 1 ? color.lime : color.red, 30), textcolor = color.white, size = size.tiny)
 
-var tb = table.new(position.top_right, 2, 21, bgcolor = color.new(color.black, 15), border_width = 1, border_color = color.new(color.gray, 70))
+var tb = table.new(position.top_right, 2, 22, bgcolor = color.new(color.black, 15), border_width = 1, border_color = color.new(color.gray, 70))
 put(r, k, v, c) =>
     table.cell(tb, 0, r, k, text_color = color.silver, text_size = size.small, text_halign = text.align_left)
     table.cell(tb, 1, r, v, text_color = c, text_size = size.small, text_halign = text.align_left)
@@ -392,36 +313,44 @@ on(b) => b ? color.lime : color.gray
 tl(h, sd) => h ? (sd == 1 ? " ✓ destek" : " ✓ direnç") : ""
 divTxt(d, a) => d == 0 ? "-" : (d == 1 ? "Boğa " : "Ayı ") + str.tostring(a) + " bar önce"
 
+kTxt = str.tostring(checks) + "/3 (BOS · 5m bölge · puan " + str.tostring(score) + ": uyum " + (divOk ? "✓" : "✗") + " temas " + (tchOk ? "✓" : "✗") + " P/D " + (pdOk ? "✓" : "✗") + ")"
+bTxt = checks == 3 ? "BEKLE (faiz ters korele değil)" : not bosOk2 ? "BEKLE (bias yönünde taze BOS yok)" : not zoneOk ? "BEKLE (5m bölge yok)" : "BEKLE (puan 0)"
+bs(b) => b == 1 ? "↑" : b == -1 ? "↓" : "→"
 if barstate.islast
     put(0,  "SCALP PANEL", syminfo.ticker + "  " + str.format_time(timenow, "HH:mm", "Europe/Istanbul"), color.white)
-    put(1,  "Trend D/4H/1H", arrow(tD) + " " + arrow(t4) + " " + arrow(t1) + "  yön " + (T == 1 ? "LONG" : "SHORT"), T == 1 ? color.lime : T == -1 ? color.red : color.gray)
-    put(2,  "HAHO 1H", px(v1) + " " + pct(close / v1 - 1) + tl(h1, sd1), on(h1))
-    put(3,  "HAHO 4H", px(v4) + " " + pct(close / v4 - 1) + tl(h4, sd4), on(h4))
-    put(4,  "HAHO D",  px(vD) + " " + pct(close / vD - 1) + tl(hD, sdD), on(hD))
+    put(1,  "Trend D/4H/1H", arrow(tD) + " " + arrow(t4) + " " + arrow(t1) + "  " + bTF + " bias " + (T == 1 ? "LONG" : "SHORT") + " (" + bTF + " kapanış " + px(bBc) + (bB >= 0 ? " > " : " < ") + "VWAP20 " + px(bBv) + ")", T == 1 ? color.lime : T == -1 ? color.red : color.gray)
+    put(2,  "HAHO 1H", px(v1) + " " + pct(close / v1 - 1) + tl(hT1, sd1), on(hT1))
+    put(3,  "HAHO 4H", px(v4) + " " + pct(close / v4 - 1) + tl(hT4, sd4), on(hT4))
+    put(4,  "HAHO D",  px(vD) + " " + pct(close / vD - 1) + tl(hTD, sdD), on(hTD))
     put(5,  "HAOF (VWAP)", px(vw) + " " + pct(close / vw - 1) + tl(vwT, sdV), on(vwT))
-    put(6,  "RSI uyum. 15m", divTxt(d15, a15), on(fr(d15, a15)))
-    put(7,  "RSI uyum. 45m", divTxt(d45, a45), on(fr(d45, a45)))
-    put(8,  "RSI uyum. 1H",  divTxt(d60, a60), on(fr(d60, a60)))
+    put(6,  "RSI uyum. 15m", divTxt(d15, a15), on(fr0(d15, a15)))
+    put(7,  "RSI uyum. 45m", divTxt(d45, a45), on(fr0(d45, a45)))
+    put(8,  "RSI uyum. 1H",  divTxt(d60, a60), on(fr0(d60, a60)))
     put(9,  "P/D (" + pdTF + " swing)", (zPos > 0.5 ? "Premium " : "Discount ") + str.tostring(zPos * 100, "#") + "%  [" + px(zL) + " – " + px(zH) + "]", on(pdOk))
-    put(10, "ICT 1m",  "B:" + b1 + "  S:" + s1, on(T == 1 ? b1 != "" : T == -1 ? s1 != "" : false))
+    put(10, "ICT 1m",  "kapalı (panel hafifletildi 23.10)", color.gray)
     put(11, "ICT 5m",  "B:" + b5 + "  S:" + s5, on(T == 1 ? b5 != "" : T == -1 ? s5 != "" : false))
     put(12, "ICT 15m", "B:" + b15 + "  S:" + s15, on(T == 1 ? b15 != "" : T == -1 ? s15 != "" : false))
-    put(20, "BOS (5m)", bosD == 0 ? "-" : (bosD == 1 ? "Boğa " : "Ayı ") + px(bosLv) + "  " + str.tostring(bosA) + " bar önce" + (bosOk ? "" : " (bayat)"), on(bosOk))
-    put(19, "Değerli bölge", zoneOk ? zone : "yok (likiditede bölge yok)", on(zoneOk))
-    put(13, "TP likidite", na(tpD) ? "yok" : tpN + " " + px(tp) + "  R:R " + str.tostring(rrNet, "#.#") + (counter ? "  (4H ters → en yakın)" : ""), on(liqOk))
-    put(14, "Kontrol", str.tostring(checks) + "/5", checks >= 3 ? color.yellow : color.gray)
-    put(15, "SİNYAL", setup ? (T == 1 ? "LONG KUR" : "SHORT KUR") : not bosOk ? "BEKLE (taze BOS yok)" : conflict ? "BEKLE (temas↔uyumsuzluk çelişkisi)" : "BEKLE", setup ? color.yellow : color.gray)
-    put(16, "Plan", zoneOk ? "E " + px(entry) + "  SL " + px(sl) + "  TP " + (na(tp) ? "-" : px(tp)) : "-", color.white)
-    put(17, "Boyut", zoneOk ? str.tostring(qty, "#.####") + " · $" + str.tostring(qty * entry, "#") + " · " + str.tostring(lev, "#.#") + "x" : "-", color.white)
+    put(20, "BOS (5m, ≥" + str.tostring(bosRun) + " mum)", bosD == 0 ? "-" : (bosD == 1 ? "Boğa " : "Ayı ") + px(bosLv) + " " + str.tostring(bosA) + " bar önce" + (bosOk ? (bosD == T ? "" : " (bias ters)") : " (bayat)"), on(bosOk2))
+    put(19, "Değerli bölge", zoneOk ? zone : "yok (yön tarafında 5m bölge yok)", on(zoneOk))
+    put(13, "TP", px(tp) + " (" + str.tostring(tpR, "#.#") + "R)", color.white)
+    put(14, "Kontrol (kapanmış mum)", kTxt[1], checks[1] == 3 ? color.yellow : color.gray)
+    put(15, "SİNYAL", sOk ? (sT == 1 ? "LONG KUR" : "SHORT KUR") + " (" + str.tostring(sK) + " mum önce kapanan)" : sK > 0 ? "BEKLE (fiyat sinyal SL'inin ötesinde)" : bTxt[1], sOk ? color.yellow : color.gray)
+    put(16, "Plan", sOk ? "E " + px(entry) + " SL " + px(sSL) + " TP " + px(sTP) : "-", color.white)
+    put(17, "Boyut", sOk ? str.tostring(sQty, "#.####") + " · $" + str.tostring(sQty * entry, "#") + " · " + str.tostring(sLev, "#.#") + "x" : "-", color.white)
+    put(21, "Faiz 1H bias 10Y/2Y", bs(y10b) + " / " + bs(y02b) + (isCmd ? (macroOk ? "  ✓ emtia " + (T == 1 ? "LONG" : "SHORT") + " serbest" : y10b != y02b ? "  ✗ faizler ayrışıyor" : "  ✗ faiz " + (y10b == 1 ? "↑ → yalnız SHORT" : "↓ → yalnız LONG")) : "  (endeks: filtre yok)"), isCmd ? on(macroOk) : color.gray)
     put(18, "Veri", str.tostring((time - t0) / 86400000.0, "#.#") + " gün", color.gray)
 
 // Aktif FVG / iFVG / OB kutuları (1m, 5m, 15m). Yeşil/kırmızı = boğa/ayı FVG, mor = iFVG, mavi/turuncu = boğa/ayı OB.
 showZ = input.bool(true, "OB/FVG kutularını çiz")
+// ★ = VWAP'a yakın bölge (yalnızca görsel, 21.10 itibarıyla filtre değil)
+vwNear(t, b) =>
+    k = (t + b) / 2 * keyTol
+    vw >= b - k and vw <= t + k
 var array<box> zb = array.new<box>()
 zbox(t, b, x, col, txt) =>
     if not na(t) and not na(x)
-        why = keyNear(t, b)
-        star = why != ""
+        star = vwNear(t, b)
+        why = "VWAP"
         array.push(zb, box.new(x, t, time, b, xloc = xloc.bar_time, extend = extend.right, border_color = color.new(col, star ? 0 : 60), border_width = star ? 2 : 1, bgcolor = color.new(col, star ? 75 : 93), text = (star ? "★ " : "") + txt + (star ? " @" + why : ""), text_color = color.new(col, star ? 0 : 50), text_size = size.tiny, text_halign = text.align_right))
 zset(tf, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17) =>
     zbox(a0, a1, a2, color.lime, tf + " Boğa FVG")
@@ -434,6 +363,5 @@ if barstate.islast and showZ
     for bx in zb
         box.delete(bx)
     array.clear(zb)
-    zset("1m", z1_0, z1_1, z1_2, z1_3, z1_4, z1_5, z1_6, z1_7, z1_8, z1_9, z1_10, z1_11, z1_12, z1_13, z1_14, z1_15, z1_16, z1_17)
     zset("5m", z5_0, z5_1, z5_2, z5_3, z5_4, z5_5, z5_6, z5_7, z5_8, z5_9, z5_10, z5_11, z5_12, z5_13, z5_14, z5_15, z5_16, z5_17)
     zset("15m", z15_0, z15_1, z15_2, z15_3, z15_4, z15_5, z15_6, z15_7, z15_8, z15_9, z15_10, z15_11, z15_12, z15_13, z15_14, z15_15, z15_16, z15_17)
