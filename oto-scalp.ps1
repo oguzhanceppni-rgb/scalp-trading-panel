@@ -1,4 +1,4 @@
-﻿# Hafta içi her gün (ScalpSim Pzt–Cum 16:15) scalp simülasyonu: 16:20–19:00 yeni işlem taraması; 19:00'da açık işlem varsa TP/SL'e kadar izlenir (güvenlik 23:45). Claude limiti dolarsa erken durur.
+﻿# Hafta içi her gün (ScalpSim Pzt–Cum 10:45; runner NY 03:00'ı bekler) scalp simülasyonu: iki pencere NY 03:00–05:00 Londra + 09:20–12:00 NY (kış TSİ 11:00–13:00 + 17:20–20:00, arada tarama yok; açık işlem script tarafından izlenir) yeni işlem taraması; sonrasında açık işlem varsa TP/SL'e kadar izlenir (güvenlik 23:45). Claude limiti dolarsa erken durur.
 # İşlem yokken 10 dk'da bir; açık işlemde 30 dk'da bir, ama fiyat SL/TP'ye değerse hemen tur + 10 dk'ya dönüş.
 # Limit dolunca durur, limit sıfırlansa da devam etmez. Bitince Hermes raporunu tetikler.
 $dir = (Get-Item (Join-Path ([Environment]::GetFolderPath('Desktop')) 'Artifical*\Scalp Panel')).FullName
@@ -10,8 +10,13 @@ $tv = "$env:USERPROFILE\tradingview-mcp\src\cli\index.js"
 $log = Join-Path $dir 'oto.log'
 $bugun = Get-Date -Format 'yyyy-MM-dd'
 $gunluk = Join-Path $dir "islem-gunlugu-$bugun.md"
-$basla = Get-Date "$bugun 16:20"
-$bitis = Get-Date "$bugun 19:00"  # yeni işlem sonu
+# 10.11: seans NY açılışına bağlı (ET 09:20–12:00 → TSİ; yaz saati/kış saati otomatik). Kış: 17:20–20:00, yaz: 16:20–19:00
+$ny = [TimeZoneInfo]::FindSystemTimeZoneById('Eastern Standard Time')
+function NY([string]$hm) { [TimeZoneInfo]::ConvertTime([DateTimeOffset]::new([datetime]"$bugun $hm", $ny.GetUtcOffset([datetime]"$bugun $hm")), [TimeZoneInfo]::Local).DateTime }
+$lbasla = NY '03:00'  # 11.11 kullanıcı: Londra penceresi (Londra açılışı → seans sonu), kış TSİ 11:00–13:00
+$lbitis = NY '05:00'
+$basla = NY '09:20'
+$bitis = NY '12:00'  # yeni işlem sonu
 $sinir = Get-Date "$bugun 23:45"  # açık işlem için güvenlik sınırı (sonra güncel fiyattan kapanır)
 
 # Bugünün günlüğü yoksa bir önceki günlüğün başlığından kur (işlem satırları hariç), bakiye önceki günün bitişinden devam
@@ -39,8 +44,8 @@ if (-not ((node $tv status) -match '"cdp_connected": true')) {
     Start-Process node -ArgumentList "`"$tv`" launch" -WindowStyle Hidden  # görünür pencere açılmasın
     Start-Sleep 60
 }
-while ((Get-Date) -lt $basla) { Start-Sleep -Seconds 5 }
-$talimat = (Get-Content -Raw -Encoding UTF8 (Join-Path $dir 'tarama.txt')) -replace '\d\d\.\d\d\.20\d\d', (Get-Date -Format 'dd.MM.yyyy') -replace 'islem-gunlugu-\d{4}-\d\d-\d\d', "islem-gunlugu-$bugun"
+while ((Get-Date) -lt $lbasla) { Start-Sleep -Seconds 5 }
+$talimat = (Get-Content -Raw -Encoding UTF8 (Join-Path $dir 'tarama.txt')) -replace '\d\d\.\d\d\.20\d\d', (Get-Date -Format 'dd.MM.yyyy') -replace 'islem-gunlugu-\d{4}-\d\d-\d\d', "islem-gunlugu-$bugun" -replace 'LBASLA_SAAT', $lbasla.ToString('HH:mm') -replace 'LBITIS_SAAT', $lbitis.ToString('HH:mm') -replace 'BASLA_SAAT', $basla.ToString('HH:mm') -replace 'BITIS_SAAT', $bitis.ToString('HH:mm')
 
 function Tur {  # $true döner: Claude limiti doldu
     $p = "Şu an: $(Get-Date -Format 'yyyy-MM-dd HH:mm')`n$talimat"
@@ -52,37 +57,63 @@ function Tur {  # $true döner: Claude limiti doldu
 
 function AcikSatir { Select-String -LiteralPath $gunluk -Pattern '\|\s*AÇIK\s*\|' -Encoding UTF8 | Select-Object -First 1 }
 
-function Dokundu($satir) {  # grafikteki son 5dk barı açık işlemin SL veya TP'sine değdi mi
-    $c = $satir.Line.Split('|') | ForEach-Object { $_.Trim() }  # 1 #, 2 açılış, 3 parite, 4 yön, 5 giriş, 6 SL, 7 TP
-    $sayi = { param($s) [double]::Parse([regex]::Match($s, '\d+(\.\d+)?').Value, [Globalization.CultureInfo]::InvariantCulture) }
-    $sl = & $sayi $c[6]; $tp = & $sayi $c[7]
-    try { $q = (node $tv quote) -join "`n" | ConvertFrom-Json } catch { return $false }
-    if (-not $q.success -or $q.symbol -notmatch [regex]::Escape($c[3])) { return $false }  # grafik başka sembolde: 30 dk dolsun
-    if ($c[4] -match 'LONG') { return ($q.low -le $sl -or $q.high -ge $tp) }
-    return ($q.high -ge $sl -or $q.low -le $tp)
+function Bakiye {  # son kapanmış işlemin bakiyesi, yoksa günün başlangıcı
+    $b = Select-String -LiteralPath $gunluk -Pattern '^\|\s*\d+\s*\|' -Encoding UTF8 | Where-Object { $_.Line -notmatch '\|\s*AÇIK\s*\|' } |
+        ForEach-Object { ($_.Line.Trim('|', ' ') -split '\|')[-1].Trim() } | Where-Object { $_ -match '\d' } | Select-Object -Last 1
+    if (-not $b) { $b = ([regex]'Başlangıç: \*\*\$([\d.]+)').Match((Get-Content -Raw -Encoding UTF8 -LiteralPath $gunluk)).Groups[1].Value }
+    [double]::Parse(($b -replace '[^\d.]', ''), $inv)
 }
 
+function Kapat([switch]$Zorla) {  # açık işlemi 1dk mumlarla script kapatır (Claude turu gerekmez): SL/TP'den ilk değen; ikisi aynı mumda → STOP. -Zorla: son fiyattan kapat
+    $satir = AcikSatir; if (-not $satir) { return }
+    $c = $satir.Line.Split('|') | ForEach-Object { $_.Trim() }  # 1 #, 2 açılış, 3 parite, 4 yön, 5 giriş, 6 SL, 7 TP, 8 miktar, 12 durum, 13 P/L, 14 bakiye
+    $sayi = { param($s) [double]::Parse([regex]::Match($s, '\d+(\.\d+)?').Value, $inv) }
+    $giris = & $sayi $c[5]; $sl = & $sayi $c[6]; $tp = & $sayi $c[7]; $mik = & $sayi $c[8]; $long = $c[4] -match 'LONG'
+    # 10.11: günlükte sembol zaten 'CAPITALCOM:XAGUSD' → eskiden 'CAPITALCOM:CAPITALCOM:…' isteniyordu, grafik yanlış feed'de kalıp 09.11 #1'i sahte STOP yazdı
+    $sym = 'CAPITALCOM:' + ($c[3] -replace '^.*:', '')
+    node $tv symbol $sym | Out-Null; node $tv timeframe 1 | Out-Null; Start-Sleep 5
+    try { $grafik = ((node $tv status) -join "`n" | ConvertFrom-Json).chart_symbol } catch { $grafik = '' }
+    if ($grafik -ne $sym) { Add-Content -LiteralPath $log -Encoding UTF8 "=== $(Get-Date -Format HH:mm:ss) Kapat: grafik '$grafik' ≠ $sym, kontrol atlandı"; return }
+    try { $bars = ((node $tv ohlcv --count 500) -join "`n" | ConvertFrom-Json).bars } catch { return }
+    if (-not $bars) { return }
+    $acilis = [DateTimeOffset](Get-Date "$bugun $($c[2])")
+    $durum = $null
+    foreach ($m in $bars | Where-Object { $_.time -ge $acilis.ToUnixTimeSeconds() + 60 }) {  # giriş dakikasından sonraki mumlar
+        $saat = [DateTimeOffset]::FromUnixTimeSeconds($m.time).ToLocalTime().ToString('HH:mm')
+        $stop = if ($long) { $m.low -le $sl } else { $m.high -ge $sl }
+        $hedef = if ($long) { $m.high -ge $tp } else { $m.low -le $tp }
+        if ($stop) { $durum = "STOP $saat"; $cikis = $sl; break }
+        if ($hedef) { $durum = "HEDEF $saat"; $cikis = $tp; break }
+    }
+    if (-not $durum -and $Zorla) { $cikis = $bars[-1].close; $durum = "KAPANIŞ $(Get-Date -Format HH:mm) @$cikis (23:45 sınırı)" }
+    if (-not $durum) { return }
+    $pl = [Math]::Round((($cikis - $giris) * $mik) * $(if ($long) { 1 } else { -1 }), 2)
+    $c[12] = $durum; $c[13] = $(if ($pl -ge 0) { '+' } else { '−' }) + [Math]::Abs($pl).ToString('0.00', $inv); $c[14] = ((Bakiye) + $pl).ToString('0.00', $inv)
+    $metin = [IO.File]::ReadAllText($gunluk).Replace($satir.Line, '| ' + ($c[1..14] -join ' | ') + ' |')
+    [IO.File]::WriteAllText($gunluk, $metin, (New-Object System.Text.UTF8Encoding $true))
+    Add-Content -LiteralPath $log -Encoding UTF8 "=== $(Get-Date -Format HH:mm:ss) script kapattı: #$($c[1]) $($c[3]) $durum P/L $($c[13])"
+}
+
+$inv = [Globalization.CultureInfo]::InvariantCulture
+$baslangic = Bakiye
 $limit = $false
-while (((Get-Date) -lt $bitis) -or ((AcikSatir) -and (Get-Date) -lt $sinir)) {  # 19:00 sonrası yalnızca açık işlem varken
+while (((Get-Date) -lt $bitis) -or ((AcikSatir) -and (Get-Date) -lt $sinir)) {  # işlem saati sonrası yalnızca açık işlem varken
+    if (AcikSatir) { Kapat; if (AcikSatir) { Start-Sleep -Seconds 60 }; continue }  # açık işlemde Claude turu yok (tek işlem kuralı), script izler
+    if ($limit) { break }  # limit dolduysa yeni tur yok, yalnız açık işlem izlendi
+    if ((Get-Date) -ge $lbitis -and (Get-Date) -lt $basla) { Start-Sleep -Seconds 60; continue }  # Londra sonu → NY açılışı arası tarama yok (backtest: ara saatler −0.12R)
     $t0 = Get-Date
-    if (Tur) { $limit = $true; break }
-    $satir = AcikSatir
-    if ($satir) {
-        while ((Get-Date) -lt $t0.AddMinutes(30) -and (Get-Date) -lt $sinir) {
-            Start-Sleep -Seconds 60
-            if (Dokundu $satir) { break }  # SL/TP'ye değdi: hemen tur, sonra 10 dk düzeni
-        }
-    } else {
-        $kalan = [Math]::Min(($t0.AddMinutes(10) - (Get-Date)).TotalSeconds, ($bitis - (Get-Date)).TotalSeconds)
+    if (Tur) { $limit = $true; continue }
+    if (-not (AcikSatir)) {
+        $kalan = [Math]::Min(($t0.AddMinutes(10) - (Get-Date)).TotalSeconds, ($(if ((Get-Date) -lt $lbitis) { $lbitis } else { $bitis }) - (Get-Date)).TotalSeconds)
         if ($kalan -gt 0) { Start-Sleep -Seconds $kalan }
     }
 }
+if (AcikSatir) { Kapat -Zorla }  # 23:45 sınırı
 
-if ($limit) {
-    $acik = if (AcikSatir) { 'Açık işlem KAPATILAMADI, tabloda AÇIK duruyor (son tur dışında P/L hesaplanmadı).' } else { 'Açık işlem yok.' }
-    Add-Content -LiteralPath $gunluk -Encoding UTF8 "`n## Gün sonu (otomatik)`n- $(Get-Date -Format HH:mm): Claude oturum limiti doldu, tarama durduruldu (talimat gereği sonraki oturuma geçilmedi). $acik"
-} else {
-    Tur | Out-Null  # gün sonu turu (19:00 sonrası, açık işlem kalmadığında ya da 23:45 sınırında)
+if ($limit -or (Tur)) {  # gün sonu turu da limite takılırsa (05.11) script yazar
+    $son = Bakiye; $n = @(Select-String -LiteralPath $gunluk -Pattern '^\|\s*\d+\s*\|' -Encoding UTF8).Count
+    $yuzde = (($son / $baslangic - 1) * 100).ToString('0.00', $inv)
+    Add-Content -LiteralPath $gunluk -Encoding UTF8 "`n## Gün sonu (otomatik)`n- $(Get-Date -Format HH:mm): Claude oturum limiti doldu, gün sonu script tarafından yazıldı (sonraki oturuma geçilmedi); açık işlem varsa script 1dk mumlarla kapattı.`n- Başlangıç **`$$($baslangic.ToString('0.00', $inv))** → bitiş **`$$($son.ToString('0.00', $inv))** (%$yuzde) · İşlem: $n"
 }
 hermes cron run $rapor | Out-Null
 Start-Sleep -Seconds 900  # rapor gönderilene kadar PC uyanık kalsın

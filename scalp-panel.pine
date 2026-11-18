@@ -15,6 +15,11 @@ keyTol  = input.float(0.10, "Bölge–likidite yakınlık toleransı %") / 100
 bosRun  = input.int(3,      "BOS: ardışık ters mum sayısı (min)")
 bosFresh = input.int(6,     "BOS tazeliği (5m bar)")
 slAtr   = input.float(1.5,  "Min SL (ATR katı)")
+swWin   = input.int(12,     "Süpürme → ters BOS en fazla (5m bar)")
+// 10.11 kullanıcı: likidite süpürmesi → ters yöne BOS → OB/FVG/iFVG girişi. Seanslar NY saatiyle (yaz/kış otomatik).
+sAsia   = input.session("2000-0000", "Asya seansı (NY saati)")
+sLon    = input.session("0200-0500", "Londra seansı (NY saati)")
+sNY     = input.session("0930-1600", "NY seansı (NY saati; önceki günün H/L'u)")
 yThr    = input.float(0.05, "Faiz hareket eşiği % (son kapanmış 1H mum)")
 
 touch(v, i) => low[i] <= v[i] * (1 + tol) and high[i] >= v[i] * (1 - tol)
@@ -171,8 +176,10 @@ bB  = cmdB ? b1h : b4
 bBv = cmdB ? b1v : b4v
 bBc = cmdB ? b1c : b4c
 bTF = cmdB ? "1H" : "4H"
-[y10b, y10v, y10c] = request.security("TVC:US10Y", "60", biasF(), lookahead = barmerge.lookahead_on)
-[y02b, y02v, y02c] = request.security("TVC:US02Y", "60", biasF(), lookahead = barmerge.lookahead_on)
+// 28.10 kullanıcı: İran-ABD savaşı bitene kadar faiz/DXY yerine Brent bias'ı (backtest: ters yönde 4H, 45dk/1H'den iyi)
+[brb, brv, brc] = request.security("TVC:UKOIL", "240", biasF(), lookahead = barmerge.lookahead_on)
+// 14.11 kullanıcı: DXY 4H bias da yalnız bilgi puanı (emtia, ters yön +1)
+[dxb, dxv, dxc] = request.security("TVC:DXY", "240", biasF(), lookahead = barmerge.lookahead_on)
 [d15, a15] = request.security(syminfo.tickerid, "15", divClosed(), lookahead = barmerge.lookahead_on)
 [d45, a45] = request.security(syminfo.tickerid, "45", divClosed(), lookahead = barmerge.lookahead_on)
 [d60, a60] = request.security(syminfo.tickerid, "60", divClosed(), lookahead = barmerge.lookahead_on)
@@ -252,32 +259,87 @@ fr0(d, a) => d != 0 and a <= fresh
 dv = fr0(d15, a15) ? d15 : fr0(d45, a45) ? d45 : fr0(d60, a60) ? d60 : 0
 // Yön = 4H bias (kapanmış 4H gövde kapanışı vs 4H VWAP20).
 // Giriş: aynı yönde taze kullanıcı BOS'u + o yönde 5m bölge içinde + puan ≥1 (RSI uyumsuzluğu / HAHO-HAOF teması / P/D).
-T = bB >= 0 ? 1 : -1
+// --- Likidite: Asya / Londra / NY (tamamlanmış son seans) H/L + önceki gün H/L. Her seviye bir kez süpürülür.
+sessHL(string ss) =>
+    inS = not na(time(timeframe.period, ss, "America/New_York"))
+    var float h = na
+    var float l = na
+    var float fh = na
+    var float fl = na
+    if inS and not inS[1]
+        h := high
+        l := low
+    else if inS
+        h := math.max(h, high)
+        l := math.min(l, low)
+    if inS[1] and not inS
+        fh := h
+        fl := l
+    [fh, fl]
+[aH, aL] = sessHL(sAsia)
+[lH, lL] = sessHL(sLon)
+[nH, nL] = sessHL(sNY)
+[pdH0, pdL0] = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+// süpürme: fitil seviyenin ötesine geçer, kapanış geri içeride (üst süpürme → SHORT, alt → LONG). Kapanışla kırılırsa seviye harcanır, sinyal yok.
+swp(float lv, bool hi) =>
+    var bool used = false
+    var float last = na
+    int r = 0
+    if na(last) or lv != last
+        last := lv
+        used := false
+    if not used and not na(lv)
+        if hi and high > lv
+            used := true
+            r := cmdB or close < lv ? -1 : 0  // 14.11: emtiada kapanış şartı yok (fitil geçince süpürme); endekste kapanış geri içeride
+        else if not hi and low < lv
+            used := true
+            r := cmdB or close > lv ? 1 : 0
+    r
+var int swD = 0
+var float swX = na
+var int swB = na
+var string swN = ""
+lvN = array.from("Asya H", "Asya L", "Londra H", "Londra L", "NY H", "NY L", "PDH", "PDL")
+rs = array.from(swp(aH, true), swp(aL, false), swp(lH, true), swp(lL, false), swp(nH, true), swp(nL, false), swp(pdH0, true), swp(pdL0, false))
+for i = 0 to 7
+    if array.get(rs, i) != 0
+        swD := array.get(rs, i)
+        swX := swD == -1 ? high : low
+        swB := bar_index
+        swN := array.get(lvN, i)
+swAge = bar_index - nz(swB, bar_index)
+bosBar = bar_index - bosA
+swOk = swD != 0 and swAge <= swWin + bosFresh
+swBos = swOk and bosOk and bosD == swD and bosBar >= swB and bosBar - swB <= swWin
+Tb = bB >= 0 ? 1 : -1
+// Yön = süpürmenin tersi (yeni model); süpürme yoksa yalnız gösterim için bias
+T = swOk ? swD : Tb
 divOk = dv == T
 zone   = T == 1 ? b5 : s5
 zoneOk = zone != ""
-zSL    = T == 1 ? bSL5 : sSL5
+zSL    = swX  // SL süpürme ucunun ötesinde
 pdTF = "5m"
 zH   = pdH5
 zL   = pdL5
 zPos = (close - zL) / (zH - zL)
 pdOk = T == 1 ? zPos < 0.5 : zPos > 0.5
 tchOk = hT1 or hT4 or hTD or vwT
-score = (divOk ? 1 : 0) + (tchOk ? 1 : 0) + (pdOk ? 1 : 0)
+var int score = 0
+score := (divOk ? 1 : 0) + (tchOk ? 1 : 0) + (pdOk ? 1 : 0)
 bosOk2 = bosOk and bosD == T
-// ZORUNLU (kullanıcı kuralı 21.10): XAU/XAG faizle ters korele işlem alır.
-// US10Y ve US02Y son KAPANMIŞ 1H mumunun değişimi (21.10 test: 4 saatlik pencereden iyi); ikisinden hiçbiri işlem yönüyle aynı yönde olmayacak, en az biri ters yönde olacak.
-y10 = y10b
-y02 = y02b
-isCmd = str.contains(syminfo.ticker, "XAU") or str.contains(syminfo.ticker, "XAG")
-// Emtia, faizin (10Y ve 2Y aynı yönde) 1H bias'ının (23.10 test: 4H'den iyi) TERSİNE işlem alır; faiz bias'ları ayrışırsa emtiada işlem yok.
-macroOk = not isCmd or (y10b == y02b and y10b == -T)
+// Kullanıcı 28.10: Brent şart DEĞİL, güçlü gösterge → Brent 4H bias'ı işlem yönünün TERSİNDEYSE puan +1. Yalnız emtia (XAU/XAG); endekslerde kullanılmaz.
+// Eski faiz kuralı (10Y==2Y, ters, zorunlu) bak2810 yedeğinde.
+macroOk = cmdB and (brb == -T or dxb == -T)
+// 28.10 backtest (brent4.py): Brent 4H işlemle AYNI yöndeyse emtiada işlem yok (emtia −0.13R → +0.46R)
+brBlock = false  // 14.11 kullanıcı + backtest (sweep1411/hibrit1411): Brent engeli kaldırıldı, Brent/DXY yalnız +1 bilgi puanı
+score := score + (macroOk ? 1 : 0)
 
 // Risk: kayıp (komisyon dahil) portföyün riskPct'i; TP = tpR × risk (20.10 backtest: sabit 3R)
 entry = close
 // SL bölgenin 0.25 ATR ötesinde ve en az slAtr × ATR(5m) uzakta
 minD  = atr * slAtr
-sl    = T == 1 ? math.min(nz(zSL, entry) - atr * 0.25, entry - minD) : math.max(nz(zSL, entry) + atr * 0.25, entry + minD)
+sl    = T == 1 ? math.min(nz(zSL, entry) - atr * 0.25, entry - minD) : math.max(nz(zSL, entry) + atr * 0.25, entry + minD)  // süpürme ucu ±0.25 ATR, en az slAtr×ATR
 risk  = math.abs(entry - sl)
 fee   = entry * feePct * 2
 tp    = entry + T * tpR * (risk + fee)
@@ -285,8 +347,9 @@ rrNet = tpR
 qty   = equity * riskPct / (risk + fee)
 lev   = qty * entry / equity
 // Üçü zorunlu: 4H yönünde taze BOS + o yönde 5m bölge + puan ≥1
-checks = (bosOk2 ? 1 : 0) + (zoneOk ? 1 : 0) + (score >= 1 ? 1 : 0)
-setup = checks == 3 and macroOk
+// 10.11 yeni model 3/3: likidite süpürmesi · sonrasında ters yöne taze BOS (≤swWin bar) · o yönde 5m OB/FVG/iFVG içinde. Puan yalnız bilgi.
+checks = (swOk ? 1 : 0) + (swBos ? 1 : 0) + (zoneOk ? 1 : 0)
+setup = checks == 3 and not brBlock
 
 // Canlı mum yok sayılır: sinyal son 1–2 KAPANMIŞ 5m mumdan (tarama 10 dk'da bir). Giriş şimdiki fiyat, SL sinyal mumundan, TP = tpR × yeni risk.
 sK   = setup[1] ? 1 : setup[2] ? 2 : 0
@@ -300,9 +363,9 @@ sLev = sQty * entry / equity
 alertcondition(sOk and sT == 1,  "LONG kurulum",  "Scalp Panel: LONG kurulum")
 alertcondition(sOk and sT == -1, "SHORT kurulum", "Scalp Panel: SHORT kurulum")
 // Doğrulama: geçmiş sinyaller (kapanmış mum, seans içi) etiket olarak — backtest sinyalleriyle karşılaştırmak için
-showSig = input.bool(false, "Geçmiş sinyal etiketleri (16:20–19:00, yalnız doğrulama için; paneli yavaşlatır)")
-hmI = hour(time, "Europe/Istanbul") * 60 + minute(time, "Europe/Istanbul")
-if showSig and barstate.isconfirmed and setup and hmI >= 980 and hmI < 1140 and dayofweek(time, "Europe/Istanbul") != dayofweek.saturday and dayofweek(time, "Europe/Istanbul") != dayofweek.sunday
+showSig = input.bool(false, "Geçmiş sinyal etiketleri (NY 09:20–12:00, yalnız doğrulama için; paneli yavaşlatır)")
+hmI = hour(time, "America/New_York") * 60 + minute(time, "America/New_York")
+if showSig and barstate.isconfirmed and setup and hmI >= 560 and hmI < 720 and dayofweek(time, "America/New_York") != dayofweek.saturday and dayofweek(time, "America/New_York") != dayofweek.sunday
     label.new(bar_index, T == 1 ? low : high, "SIG " + (T == 1 ? "L " : "S ") + str.format_time(time, "yyyy-MM-dd HH:mm", "Europe/Istanbul"), style = T == 1 ? label.style_label_up : label.style_label_down, color = color.new(T == 1 ? color.lime : color.red, 30), textcolor = color.white, size = size.tiny)
 
 var tb = table.new(position.top_right, 2, 22, bgcolor = color.new(color.black, 15), border_width = 1, border_color = color.new(color.gray, 70))
@@ -313,12 +376,12 @@ on(b) => b ? color.lime : color.gray
 tl(h, sd) => h ? (sd == 1 ? " ✓ destek" : " ✓ direnç") : ""
 divTxt(d, a) => d == 0 ? "-" : (d == 1 ? "Boğa " : "Ayı ") + str.tostring(a) + " bar önce"
 
-kTxt = str.tostring(checks) + "/3 (BOS · 5m bölge · puan " + str.tostring(score) + ": uyum " + (divOk ? "✓" : "✗") + " temas " + (tchOk ? "✓" : "✗") + " P/D " + (pdOk ? "✓" : "✗") + ")"
-bTxt = checks == 3 ? "BEKLE (faiz ters korele değil)" : not bosOk2 ? "BEKLE (bias yönünde taze BOS yok)" : not zoneOk ? "BEKLE (5m bölge yok)" : "BEKLE (puan 0)"
+kTxt = str.tostring(checks) + "/3 (süpürme · ters BOS · 5m bölge; bilgi puanı " + str.tostring(score) + ": uyum " + (divOk ? "✓" : "✗") + " temas " + (tchOk ? "✓" : "✗") + " P/D " + (pdOk ? "✓" : "✗") + (cmdB ? " Brent/DXY " + (macroOk ? "✓" : "✗") : "") + ")"
+bTxt = checks == 3 and brBlock ? "BEKLE (Brent 4H aynı yönde)" : not swOk ? "BEKLE (taze likidite süpürmesi yok)" : not swBos ? "BEKLE (süpürme sonrası ters BOS yok)" : "BEKLE (5m bölge yok)"
 bs(b) => b == 1 ? "↑" : b == -1 ? "↓" : "→"
 if barstate.islast
     put(0,  "SCALP PANEL", syminfo.ticker + "  " + str.format_time(timenow, "HH:mm", "Europe/Istanbul"), color.white)
-    put(1,  "Trend D/4H/1H", arrow(tD) + " " + arrow(t4) + " " + arrow(t1) + "  " + bTF + " bias " + (T == 1 ? "LONG" : "SHORT") + " (" + bTF + " kapanış " + px(bBc) + (bB >= 0 ? " > " : " < ") + "VWAP20 " + px(bBv) + ")", T == 1 ? color.lime : T == -1 ? color.red : color.gray)
+    put(1,  "Trend D/4H/1H", arrow(tD) + " " + arrow(t4) + " " + arrow(t1) + "  " + bTF + " bias " + (Tb == 1 ? "LONG" : "SHORT") + " (" + bTF + " kapanış " + px(bBc) + (bB >= 0 ? " > " : " < ") + "VWAP20 " + px(bBv) + ")", T == 1 ? color.lime : T == -1 ? color.red : color.gray)
     put(2,  "HAHO 1H", px(v1) + " " + pct(close / v1 - 1) + tl(hT1, sd1), on(hT1))
     put(3,  "HAHO 4H", px(v4) + " " + pct(close / v4 - 1) + tl(hT4, sd4), on(hT4))
     put(4,  "HAHO D",  px(vD) + " " + pct(close / vD - 1) + tl(hTD, sdD), on(hTD))
@@ -327,7 +390,7 @@ if barstate.islast
     put(7,  "RSI uyum. 45m", divTxt(d45, a45), on(fr0(d45, a45)))
     put(8,  "RSI uyum. 1H",  divTxt(d60, a60), on(fr0(d60, a60)))
     put(9,  "P/D (" + pdTF + " swing)", (zPos > 0.5 ? "Premium " : "Discount ") + str.tostring(zPos * 100, "#") + "%  [" + px(zL) + " – " + px(zH) + "]", on(pdOk))
-    put(10, "ICT 1m",  "kapalı (panel hafifletildi 23.10)", color.gray)
+    put(10, "Likidite (NY saati)", "Asya " + px(aH) + "/" + px(aL) + " · Lon " + px(lH) + "/" + px(lL) + " · NY " + px(nH) + "/" + px(nL) + " · PD " + px(pdH0) + "/" + px(pdL0), color.white)
     put(11, "ICT 5m",  "B:" + b5 + "  S:" + s5, on(T == 1 ? b5 != "" : T == -1 ? s5 != "" : false))
     put(12, "ICT 15m", "B:" + b15 + "  S:" + s15, on(T == 1 ? b15 != "" : T == -1 ? s15 != "" : false))
     put(20, "BOS (5m, ≥" + str.tostring(bosRun) + " mum)", bosD == 0 ? "-" : (bosD == 1 ? "Boğa " : "Ayı ") + px(bosLv) + " " + str.tostring(bosA) + " bar önce" + (bosOk ? (bosD == T ? "" : " (bias ters)") : " (bayat)"), on(bosOk2))
@@ -337,8 +400,8 @@ if barstate.islast
     put(15, "SİNYAL", sOk ? (sT == 1 ? "LONG KUR" : "SHORT KUR") + " (" + str.tostring(sK) + " mum önce kapanan)" : sK > 0 ? "BEKLE (fiyat sinyal SL'inin ötesinde)" : bTxt[1], sOk ? color.yellow : color.gray)
     put(16, "Plan", sOk ? "E " + px(entry) + " SL " + px(sSL) + " TP " + px(sTP) : "-", color.white)
     put(17, "Boyut", sOk ? str.tostring(sQty, "#.####") + " · $" + str.tostring(sQty * entry, "#") + " · " + str.tostring(sLev, "#.#") + "x" : "-", color.white)
-    put(21, "Faiz 1H bias 10Y/2Y", bs(y10b) + " / " + bs(y02b) + (isCmd ? (macroOk ? "  ✓ emtia " + (T == 1 ? "LONG" : "SHORT") + " serbest" : y10b != y02b ? "  ✗ faizler ayrışıyor" : "  ✗ faiz " + (y10b == 1 ? "↑ → yalnız SHORT" : "↓ → yalnız LONG")) : "  (endeks: filtre yok)"), isCmd ? on(macroOk) : color.gray)
-    put(18, "Veri", str.tostring((time - t0) / 86400000.0, "#.#") + " gün", color.gray)
+    put(21, "Brent 4H bias (puan)", bs(brb) + " · DXY " + bs(dxb) + (not cmdB ? "  (endeks: kullanılmaz)" : macroOk ? "  ✓ ters yön → +1 bilgi puanı" : "  puan yok (engel değil)"), on(macroOk))
+    put(18, "Süpürme", swD == 0 ? "-" : swN + (swD == -1 ? " (üst → SHORT) uç " : " (alt → LONG) uç ") + px(swX) + " · " + str.tostring(swAge) + " bar önce" + (swBos ? " · ters BOS ✓" : " · ters BOS bekleniyor"), on(swBos))
 
 // Aktif FVG / iFVG / OB kutuları (1m, 5m, 15m). Yeşil/kırmızı = boğa/ayı FVG, mor = iFVG, mavi/turuncu = boğa/ayı OB.
 showZ = input.bool(true, "OB/FVG kutularını çiz")
